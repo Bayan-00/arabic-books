@@ -52,7 +52,7 @@ async function getParsed(title) {
   });
   const p = data.parse;
   if (!p || typeof p.text !== "string") return null;
-  return { doc: harbor.parseHtml(p.text), categories: p.categories || [], htmlLength: p.text.length };
+  return { doc: await harbor.parseHtml(p.text), categories: p.categories || [], htmlLength: p.text.length };
 }
 
 
@@ -73,6 +73,41 @@ async function plainText(title) {
 
 function errText(e) {
   return String((e && e.message) || e || "unknown error");
+}
+
+function absUrl(url) {
+  if (!url) return undefined;
+  if (/^https?:\/\//i.test(url)) return url;
+  if (url.startsWith("//")) return "https:" + url;
+  if (url.startsWith("/")) return BASE + url;
+  return undefined;
+}
+
+// Best-effort covers: the lead image of each page, when the page has one.
+// Any failure is ignored (the book simply has no cover).
+async function withCovers(list) {
+  for (let i = 0; i < list.length; i += 50) {
+    const chunk = list.slice(i, i + 50);
+    try {
+      const data = await api({
+        action: "query",
+        prop: "pageimages",
+        piprop: "thumbnail",
+        pithumbsize: "300",
+        pilimit: "50",
+        titles: chunk.map((x) => x.id).join("|"),
+      });
+      const pages = (data.query && data.query.pages) || [];
+      const byTitle = {};
+      for (const pg of Array.isArray(pages) ? pages : Object.values(pages)) {
+        if (pg && pg.title && pg.thumbnail && pg.thumbnail.source) byTitle[pg.title] = pg.thumbnail.source;
+      }
+      for (const x of chunk) if (byTitle[x.id]) x.cover = byTitle[x.id];
+    } catch (e) {
+      // ignore
+    }
+  }
+  return list;
 }
 
 function rootTitle(title) {
@@ -111,7 +146,7 @@ async function searchTitles(query, offset) {
     srprop: "",
   });
   const hits = (data.query && data.query.search) || [];
-  return uniqueSummaries(hits.map((h) => h.title));
+  return withCovers(uniqueSummaries(hits.map((h) => h.title)));
 }
 
 async function categoryTitles(offset) {
@@ -125,7 +160,7 @@ async function categoryTitles(offset) {
   });
   const members = (data.query && data.query.categorymembers) || [];
   const slice = members.slice(offset, offset + PAGE_SIZE);
-  return uniqueSummaries(slice.map((m) => m.title));
+  return withCovers(uniqueSummaries(slice.map((m) => m.title)));
 }
 
 // Decode an internal wiki link like "/wiki/%D9%83.../%D9%81..." to a page title.
@@ -203,10 +238,28 @@ const plugin = {
         .filter(Boolean)
         .slice(0, 6);
 
+      let cover;
+      try {
+        cover = (await withCovers([toSummary(id)]))[0].cover;
+      } catch (e) {
+        cover = undefined;
+      }
+      if (!cover) {
+        for (const img of doc.querySelectorAll("img")) {
+          const src = img.attr("src") || "";
+          const w = Number(img.attr("width")) || 0;
+          if (!/upload\.wikimedia\.org/.test(src)) continue;
+          if (/icon|logo|ambox|information|oojs|edit-|\.svg/i.test(src)) continue;
+          if (w && w < 100) continue;
+          cover = absUrl(src);
+          break;
+        }
+      }
+
       let description = paragraphs[0] ? paragraphs[0].slice(0, 600) : undefined;
       if (DEBUG) description = (description ? description + "\n\n" : "") + info;
 
-      return { id, title: id, altTitles: [], description, author, originalLanguage: "ar", genres, siteUrl: pageUrl(id) };
+      return { id, title: id, altTitles: [], description, author, originalLanguage: "ar", genres, cover, siteUrl: pageUrl(id) };
     } catch (e) {
       return {
         id,
