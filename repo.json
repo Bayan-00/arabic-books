@@ -1,0 +1,14 @@
+{
+  "type": "ebook",
+  "name": "المكتبة العربية المفتوحة",
+  "plugins": [
+    {
+      "id": "wikisource-ar",
+      "name": "ويكي مصدر العربية",
+      "version": "1.0.0",
+      "lang": "ar",
+      "nsfw": false,
+      "entry": "wikisource-ar.plugin.js"
+    }
+  ]
+}
