@@ -8,6 +8,10 @@ const BASE = "https://ar.wikisource.org";
 const API = BASE + "/w/api.php";
 const PAGE_SIZE = 48;
 
+// While testing, errors and counters are shown inside the app (in the description
+// and chapter list). Set to false once everything works.
+const DEBUG = true;
+
 // Editable: category used for the default "popular" list. If it is empty or does
 // not exist, the plugin falls back to a plain keyword search (DEFAULT_QUERY).
 const POPULAR_CATEGORY = "تصنيف:روايات";
@@ -48,15 +52,40 @@ async function getParsed(title) {
   });
   const p = data.parse;
   if (!p || typeof p.text !== "string") return null;
-  return { doc: harbor.parseHtml(p.text), categories: p.categories || [] };
+  return { doc: harbor.parseHtml(p.text), categories: p.categories || [], htmlLength: p.text.length };
+}
+
+
+// Plain-text fallback that does not depend on HTML parsing (TextExtracts).
+async function plainText(title) {
+  const data = await api({
+    action: "query",
+    prop: "extracts",
+    explaintext: "1",
+    exlimit: "1",
+    redirects: "1",
+    titles: title,
+  });
+  const pages = (data.query && data.query.pages) || [];
+  const page = Array.isArray(pages) ? pages[0] : Object.values(pages)[0];
+  return page && page.extract ? String(page.extract).trim() : "";
+}
+
+function errText(e) {
+  return String((e && e.message) || e || "unknown error");
 }
 
 function rootTitle(title) {
   return String(title || "").split("/")[0].trim();
 }
 
+// Absolute link to the page on Wikisource (Harbor shows it as the "open in browser" button).
+function pageUrl(title) {
+  return BASE + "/wiki/" + encodeURIComponent(String(title).replace(/ /g, "_"));
+}
+
 function toSummary(title) {
-  return { id: title, title, altTitles: [], genres: [] };
+  return { id: title, title, altTitles: [], genres: [], originalLanguage: "ar", siteUrl: pageUrl(title) };
 }
 
 function uniqueSummaries(titles) {
@@ -118,13 +147,22 @@ const plugin = {
     if (tagId && tagId.startsWith("q:")) {
       return searchTitles(tagId.slice(2), offset);
     }
-    try {
-      const fromCategory = await categoryTitles(offset);
-      if (fromCategory.length || offset > 0) return fromCategory;
-    } catch (e) {
-      // fall through to the keyword search
+    let fromCategory = [];
+    if (offset === 0) {
+      try {
+        fromCategory = await categoryTitles(0);
+      } catch (e) {
+        fromCategory = [];
+      }
     }
-    return searchTitles(DEFAULT_QUERY, offset);
+    let fromSearch = [];
+    try {
+      fromSearch = await searchTitles(DEFAULT_QUERY, offset);
+    } catch (e) {
+      if (!fromCategory.length) throw e;
+    }
+    const seen = new Set(fromCategory.map((x) => x.id));
+    return fromCategory.concat(fromSearch.filter((x) => !seen.has(x.id)));
   },
 
   async search(query, offset, tagId) {
@@ -132,79 +170,120 @@ const plugin = {
   },
 
   async detail(id) {
-    const parsed = await getParsed(id);
-    if (!parsed) return null;
-    const { doc, categories } = parsed;
+    let info = "";
+    try {
+      const parsed = await getParsed(id);
+      if (!parsed) throw new Error("parse returned no text for: " + id);
+      const { doc, categories } = parsed;
 
-    const paragraphs = doc
-      .querySelectorAll("p")
-      .map((p) => p.text().trim())
-      .filter((t) => t.length > 40);
+      const paragraphs = doc
+        .querySelectorAll("p")
+        .map((p) => p.text().trim())
+        .filter((t) => t.length > 40);
+      const anchors = doc.querySelectorAll("a");
+      const subLinks = anchors.filter((a) => {
+        const t = hrefToTitle(a.attr("href"));
+        return t && t.startsWith(id + "/");
+      }).length;
+      info = "[debug] html=" + parsed.htmlLength + " p=" + paragraphs.length +
+        " a=" + anchors.length + " sub=" + subLinks;
 
-    let author;
-    for (const a of doc.querySelectorAll("a")) {
-      const t = hrefToTitle(a.attr("href"));
-      if (t && t.startsWith("مؤلف:")) {
-        author = a.text().trim() || t.slice(5);
-        break;
+      let author;
+      for (const a of anchors) {
+        const t = hrefToTitle(a.attr("href"));
+        if (t && t.startsWith("مؤلف:")) {
+          author = a.text().trim() || t.slice(5);
+          break;
+        }
       }
+
+      const genres = categories
+        .filter((c) => !c.hidden)
+        .map((c) => String(c.category || "").replace(/_/g, " ").trim())
+        .filter(Boolean)
+        .slice(0, 6);
+
+      let description = paragraphs[0] ? paragraphs[0].slice(0, 600) : undefined;
+      if (DEBUG) description = (description ? description + "\n\n" : "") + info;
+
+      return { id, title: id, altTitles: [], description, author, originalLanguage: "ar", genres, siteUrl: pageUrl(id) };
+    } catch (e) {
+      return {
+        id,
+        title: id,
+        altTitles: [],
+        description: DEBUG ? "[debug error] " + errText(e) : undefined,
+        siteUrl: pageUrl(id),
+        originalLanguage: "ar",
+        genres: [],
+      };
     }
-
-    const genres = categories
-      .filter((c) => !c.hidden)
-      .map((c) => String(c.category || "").replace(/_/g, " ").trim())
-      .filter(Boolean)
-      .slice(0, 6);
-
-    return {
-      id,
-      title: id,
-      altTitles: [],
-      description: paragraphs[0] ? paragraphs[0].slice(0, 600) : undefined,
-      author,
-      originalLanguage: "ar",
-      genres,
-    };
   },
 
-  // Chapters are the sub-pages linked from the book's main page, in the order
-  // they appear on that page. If there are none, the page itself is one chapter.
+  // Chapters are the sub-pages linked from the book's main page, in page order.
+  // If none are found, the page itself is a single chapter.
   async chapters(id) {
-    const parsed = await getParsed(id);
-    if (!parsed) return [];
-    const prefix = id + "/";
-    const seen = new Set();
-    const out = [];
-    for (const a of parsed.doc.querySelectorAll("a")) {
-      const t = hrefToTitle(a.attr("href"));
-      if (!t || !t.startsWith(prefix) || seen.has(t)) continue;
-      seen.add(t);
-      out.push({
-        id: t,
-        position: out.length,
-        title: t.slice(prefix.length).replace(/\//g, " › "),
-        pages: 0,
-        language: "ar",
-      });
+    const single = (note) => [{
+      id,
+      position: 0,
+      title: DEBUG && note ? id + " " + note : id,
+      pages: 0,
+      language: "ar",
+    }];
+    try {
+      const parsed = await getParsed(id);
+      if (!parsed) return single("[debug: no parse text]");
+      const prefix = id + "/";
+      const seen = new Set();
+      const out = [];
+      for (const a of parsed.doc.querySelectorAll("a")) {
+        const t = hrefToTitle(a.attr("href"));
+        if (!t || !t.startsWith(prefix) || seen.has(t)) continue;
+        seen.add(t);
+        out.push({
+          id: t,
+          position: out.length,
+          title: t.slice(prefix.length).replace(/\//g, " › "),
+          pages: 0,
+          language: "ar",
+        });
+      }
+      return out.length ? out : single("");
+    } catch (e) {
+      return single("[debug error: " + errText(e) + "]");
     }
-    if (!out.length) {
-      return [{ id, position: 0, title: id, pages: 0, language: "ar" }];
-    }
-    return out;
   },
 
   async content(chapterId) {
-    const parsed = await getParsed(chapterId);
-    if (!parsed) return "";
-    const doc = parsed.doc;
-    // Keep DOM order. Never sort or deduplicate prose.
-    let blocks = doc.querySelectorAll(
-      ".mw-parser-output > p, .mw-parser-output > blockquote, .mw-parser-output > h2, .mw-parser-output > h3, .mw-parser-output > .poem",
-    );
-    let text = blocks.map((n) => n.text().trim()).filter(Boolean).join("\n\n");
+    let text = "";
+    let problem = "";
+    try {
+      const parsed = await getParsed(chapterId);
+      if (parsed) {
+        // Keep DOM order. Never sort or deduplicate prose.
+        const blocks = parsed.doc.querySelectorAll(
+          ".mw-parser-output > p, .mw-parser-output > blockquote, .mw-parser-output > h2, .mw-parser-output > h3, .mw-parser-output > .poem",
+        );
+        text = blocks.map((n) => n.text().trim()).filter(Boolean).join("\n\n");
+        if (!text) {
+          const root = parsed.doc.querySelector(".mw-parser-output");
+          text = root ? root.text().trim() : "";
+        }
+      }
+    } catch (e) {
+      problem = errText(e);
+    }
     if (!text) {
-      const root = doc.querySelector(".mw-parser-output");
-      text = root ? root.text().trim() : "";
+      try {
+        text = await plainText(chapterId);
+      } catch (e) {
+        problem = problem || errText(e);
+      }
+    }
+    if (!text) {
+      return DEBUG
+        ? "[debug] لم يُعثر على نص لهذه الصفحة. " + (problem ? "الخطأ: " + problem : "الصفحة فارغة أو تعتمد على صور ممسوحة ضوئياً.")
+        : "";
     }
     return text;
   },

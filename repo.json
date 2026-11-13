@@ -5,7 +5,7 @@
     {
       "id": "wikisource-ar",
       "name": "ويكي مصدر العربية",
-      "version": "1.0.0",
+      "version": "1.0.2",
       "lang": "ar",
       "nsfw": false,
       "entry": "wikisource-ar.plugin.js"
