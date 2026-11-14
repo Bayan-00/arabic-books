@@ -3,9 +3,17 @@
   "name": "المكتبة العربية المفتوحة",
   "plugins": [
     {
+      "id": "hindawi-ar",
+      "name": "مؤسسة هنداوي",
+      "version": "1.0.0",
+      "lang": "ar",
+      "nsfw": false,
+      "entry": "hindawi-ar.plugin.js"
+    },
+    {
       "id": "wikisource-ar",
       "name": "ويكي مصدر العربية",
-      "version": "1.0.3",
+      "version": "1.1.0",
       "lang": "ar",
       "nsfw": false,
       "entry": "wikisource-ar.plugin.js"
